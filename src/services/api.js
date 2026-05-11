@@ -10,6 +10,53 @@ export async function fetchMatches() {
   return response.json();
 }
 
+export async function saveMatchResult(id, result) {
+  const response = await fetch(`${API_BASE_URL}/api/matches/${encodeURIComponent(id)}/result`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(result),
+  });
+
+  if (!response.ok) {
+    let message = '保存赛果失败';
+
+    try {
+      const data = await response.json();
+      message = data.message || message;
+    } catch (error) {
+      // Ignore non-JSON error bodies.
+    }
+
+    const error = new Error(response.status === 404 ? '未找到比赛' : message);
+    error.status = response.status;
+    throw error;
+  }
+
+  return response.json();
+}
+
+export async function fetchBacktestMatches() {
+  const response = await fetch(`${API_BASE_URL}/api/backtest/matches`);
+
+  if (!response.ok) {
+    throw new Error('获取回测明细失败');
+  }
+
+  return response.json();
+}
+
+export async function fetchBacktestSummary() {
+  const response = await fetch(`${API_BASE_URL}/api/backtest/summary`);
+
+  if (!response.ok) {
+    throw new Error('获取回测统计失败');
+  }
+
+  return response.json();
+}
+
 export async function fetchMatchById(id) {
   const response = await fetch(`${API_BASE_URL}/api/matches/${encodeURIComponent(id)}`);
 
