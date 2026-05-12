@@ -14,6 +14,7 @@ import {
   LayoutDashboard,
   Lightbulb,
   Menu,
+  RefreshCw,
   Save,
   Settings,
   ShieldAlert,
@@ -25,25 +26,38 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { leagues, teams } from './data/mockData.js';
-import { fetchBacktestMatches, fetchBacktestSummary, fetchMatchById, fetchMatches, saveMatchResult, updateMatchPrediction } from './services/api.js';
+import { fetchBacktestMatches, fetchBacktestSummary, fetchMatchById, fetchMatches, fetchStandings, fetchSyncLogs, fetchSyncStatus, saveMatchResult, syncFootballStandings, syncMatches, updateMatchPrediction } from './services/api.js';
 import { calculateProbability, validateMatchData } from './utils/calculateProbability.js';
 import { formatMatchTime } from './utils/format.js';
 
 const navItems = [
   { label: '数据管理', path: '#/data-management', icon: Save },
   { label: '回测统计', path: '#/backtest', icon: ClipboardCheck },
+  { label: '数据同步', path: '#/sync', icon: RefreshCw },
   { label: '首页', path: '#/', icon: LayoutDashboard },
   { label: '联赛', path: '#/leagues', icon: Trophy },
+  { label: '积分榜', path: '#/standings', icon: BarChart3 },
   { label: '模型说明', path: '#/model', icon: CircleGauge },
 ];
 
 const leagueFilters = [
   { label: '全部', value: 'all' },
-  { label: '英超', value: 'premier-league' },
-  { label: '西甲', value: 'la-liga' },
-  { label: '意甲', value: 'serie-a' },
-  { label: '德甲', value: 'bundesliga' },
+  { label: '英超', value: 'PL' },
+  { label: '西甲', value: 'PD' },
+  { label: '德甲', value: 'BL1' },
+  { label: '意甲', value: 'SA' },
+  { label: '法甲', value: 'FL1' },
+  { label: '欧冠', value: 'CL' },
 ];
+
+const competitionDisplayMap = {
+  PL: '英超',
+  PD: '西甲',
+  BL1: '德甲',
+  SA: '意甲',
+  FL1: '法甲',
+  CL: '欧冠',
+};
 
 const DATA_LOADING_TEXT = '数据加载中...';
 const DATA_LOAD_ERROR_TEXT = '数据加载失败，请检查后端服务是否启动';
@@ -54,9 +68,8 @@ const teamMap = Object.fromEntries(teams.map((team) => [team.id, team]));
 function matchLeagueFilter(match, selectedLeague) {
   if (selectedLeague === 'all') return true;
 
-  const filter = leagueFilters.find((item) => item.value === selectedLeague);
-
-  return match.leagueId === selectedLeague || match.leagueName === filter?.label || match.league?.name === filter?.label;
+  const code = match.competitionCode || match.leagueCode || '';
+  return code === selectedLeague;
 }
 
 function matchTeamSearch(match, keyword) {
@@ -105,6 +118,10 @@ function App() {
         ? <DataManagementPage />
         : route === '/backtest'
         ? <BacktestPage />
+        : route === '/sync'
+        ? <SyncPage />
+        : route === '/standings'
+        ? <StandingsPage />
         : route === '/model'
         ? <ModelPage />
         : <HomePage />;
@@ -189,7 +206,7 @@ function HomePage() {
       try {
         setLoading(true);
         setLoadError(false);
-        const data = await fetchMatches();
+        const data = await fetchMatches(selectedLeague !== 'all' ? selectedLeague : undefined);
 
         if (active) {
           setMatchList(Array.isArray(data) ? data : []);
@@ -210,7 +227,7 @@ function HomePage() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [selectedLeague]);
 
   if (loading) {
     return <LoadingState />;
@@ -430,15 +447,18 @@ function MatchDetailPage({ matchId }) {
     return (
       <PageTitle
         title="未找到比赛"
-        description="当前 match id 在 mockData.js 中不存在，请从首页比赛列表重新进入详情。"
+        description="当前 match id 在数据库中不存在，请从首页比赛列表重新进入详情。"
       />
     );
   }
 
-  const { homeWin, draw, awayWin } = match.probability;
+  const { homeWin, draw, awayWin, computed } = match.probability;
+  const factors = match.analysisFactors || {};
+  const standingsComplete = factors.standingsComplete !== false;
 
   return (
     <div className="space-y-6">
+      {/* 比赛头部 */}
       <section className="rounded border border-line bg-panel p-5">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
@@ -451,41 +471,104 @@ function MatchDetailPage({ matchId }) {
             <p className="mt-2 text-sm text-slate-400">{formatMatchTime(match.time)}</p>
           </div>
           <div className="grid grid-cols-3 gap-3 text-center">
-            <ProbabilityDonut label="主胜" value={homeWin} color="#28e6a7" />
-            <ProbabilityDonut label="平局" value={draw} color="#f7c948" />
-            <ProbabilityDonut label="客胜" value={awayWin} color="#ff6b7a" />
+            <ProbabilityDonut label="主胜" value={computed ? homeWin : null} color="#28e6a7" />
+            <ProbabilityDonut label="平局" value={computed ? draw : null} color="#f7c948" />
+            <ProbabilityDonut label="客胜" value={computed ? awayWin : null} color="#ff6b7a" />
           </div>
         </div>
+        {!computed && (
+          <div className="mt-4 rounded border border-amberx/30 bg-amberx/[0.04] px-4 py-3 text-sm text-amberx">
+            ⚠ 概率数据尚未计算，请先在数据管理页面点击"重新计算概率"或执行 predictions/recalculate 同步。
+          </div>
+        )}
       </section>
 
+      {/* 积分榜数据分析因子 */}
+      {Object.keys(factors).length > 0 && (
+        <DataCard title="积分榜数据分析因子" icon={BarChart3}>
+          {!standingsComplete && (
+            <div className="mb-4 rounded border border-amberx/20 bg-amberx/[0.03] px-4 py-2.5 text-xs text-amberx">
+              缺少完整积分榜数据，部分因子使用基础规则估算。
+            </div>
+          )}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <FactorItem label="主队排名" value={factors.homeRank != null ? `第 ${factors.homeRank} 名` : '暂无'} />
+            <FactorItem label="客队排名" value={factors.awayRank != null ? `第 ${factors.awayRank} 名` : '暂无'} />
+            <FactorItem label="积分差" value={`${factors.pointsDiff ?? 0} 分`} highlight={factors.pointsDiff > 0 ? 'text-greenx' : factors.pointsDiff < 0 ? 'text-redx' : ''} />
+            <FactorItem label="主队积分" value={`${factors.homePoints ?? 0} 分`} />
+            <FactorItem label="客队积分" value={`${factors.awayPoints ?? 0} 分`} />
+            <FactorItem label="净胜球差" value={`${factors.goalDiff ?? 0}`} highlight={factors.goalDiff > 0 ? 'text-greenx' : factors.goalDiff < 0 ? 'text-redx' : ''} />
+            <FactorItem label="主队进球/失球" value={`${factors.homeGoalsFor} / ${factors.homeGoalsAgainst}`} />
+            <FactorItem label="客队进球/失球" value={`${factors.awayGoalsFor} / ${factors.awayGoalsAgainst}`} />
+            <FactorItem label="主队近期战绩" value={factors.homeRecentForm || '暂无'} />
+            <FactorItem label="客队近期战绩" value={factors.awayRecentForm || '暂无'} />
+            <FactorItem label="主队胜率" value={factors.homeWinRate || '暂无'} />
+            <FactorItem label="客队胜率" value={factors.awayWinRate || '暂无'} />
+            <FactorItem label="主场优势" value={factors.homeAdvantage || '+8 分'} highlight="text-cyanx" />
+          </div>
+          <div className="mt-4 rounded border border-line bg-panel-soft px-4 py-3">
+            <div className="flex items-start gap-2">
+              <Lightbulb size={16} className="mt-0.5 shrink-0 text-cyanx" />
+              <div>
+                <p className="text-xs font-medium text-slate-300">模型说明</p>
+                <p className="mt-1 text-xs leading-5 text-slate-400">{factors.modelDescription || '基于积分榜排名的规则模型'}</p>
+                <p className="mt-1 text-xs text-slate-500">数据来源：{factors.dataSource || '—'}</p>
+              </div>
+            </div>
+          </div>
+        </DataCard>
+      )}
+
+      {/* 近期战绩 & 攻防数据 */}
       <section className="grid gap-4 lg:grid-cols-2">
         <DataCard title="双方近期战绩" icon={Activity}>
-          <FormLine team={match.homeTeam.name} values={match.form.home} />
-          <FormLine team={match.awayTeam.name} values={match.form.away} />
+          {match.form.home.length > 0 || match.form.away.length > 0 ? (
+            <>
+              <FormLine team={match.homeTeam.name} values={match.form.home} />
+              <FormLine team={match.awayTeam.name} values={match.form.away} />
+            </>
+          ) : (
+            <div className="text-sm text-slate-500">暂无近期战绩数据</div>
+          )}
         </DataCard>
         <DataCard title="攻防数据" icon={Dumbbell}>
-          <TeamMetrics label={match.homeTeam.name} data={match.attackDefense.home} />
-          <TeamMetrics label={match.awayTeam.name} data={match.attackDefense.away} />
+          {(match.attackDefense.home.attack > 0 || match.attackDefense.away.attack > 0) ? (
+            <>
+              <TeamMetrics label={match.homeTeam.name} data={match.attackDefense.home} />
+              <TeamMetrics label={match.awayTeam.name} data={match.attackDefense.away} />
+            </>
+          ) : (
+            <div className="text-sm text-slate-500">暂无球队攻防统计数据</div>
+          )}
         </DataCard>
       </section>
 
+      {/* 历史交锋 & 系统分析结论 */}
       <section className="grid gap-4 lg:grid-cols-[0.85fr_1.15fr]">
         <DataCard title="历史交锋" icon={Trophy}>
-          <div className="space-y-3">
-            {match.headToHead.map((item) => (
-              <div key={item.id} className="rounded border border-line bg-panel-soft px-4 py-3 text-sm text-slate-300">
-                {item.score}
-              </div>
-            ))}
-          </div>
+          {match.headToHead.length > 0 ? (
+            <div className="space-y-3">
+              {match.headToHead.map((item) => (
+                <div key={item.id} className="rounded border border-line bg-panel-soft px-4 py-3 text-sm text-slate-300">
+                  {item.score}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-sm text-slate-500">暂无历史交锋数据</div>
+          )}
         </DataCard>
         <DataCard title="系统分析结论" icon={ShieldCheck}>
-          <p className="text-sm leading-7 text-slate-300">{match.conclusion}</p>
-          <div className="mt-5 grid gap-3 sm:grid-cols-3">
-            {match.signals.map((signal) => (
-              <Signal key={signal.label} label={signal.label} value={signal.value} />
-            ))}
-          </div>
+          <p className="text-sm leading-7 text-slate-300">{match.conclusion || match.engineConclusion || '暂无分析结论'}</p>
+          {match.signals.length > 0 ? (
+            <div className="mt-5 grid gap-3 sm:grid-cols-3">
+              {match.signals.map((signal) => (
+                <Signal key={signal.label} label={signal.label} value={signal.value} />
+              ))}
+            </div>
+          ) : (
+            <div className="mt-5 text-sm text-slate-500">暂无预测信号数据</div>
+          )}
         </DataCard>
       </section>
     </div>
@@ -1282,6 +1365,412 @@ function BacktestPage() {
   );
 }
 
+function SyncPage() {
+  const [logs, setLogs] = useState([]);
+  const [status, setStatus] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState(null);
+
+  async function loadSyncData() {
+    try {
+      setLoading(true);
+      setLoadError(false);
+      const [logsData, statusData] = await Promise.all([
+        fetchSyncLogs(),
+        fetchSyncStatus(),
+      ]);
+      setLogs(Array.isArray(logsData) ? logsData : []);
+      setStatus(statusData);
+    } catch (error) {
+      setLoadError(true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadSyncData();
+  }, []);
+
+  async function handleSync() {
+    try {
+      setSyncing(true);
+      setSyncMessage(null);
+      const result = await syncMatches();
+      setSyncMessage({ type: 'success', text: result.message || '比赛数据同步完成' });
+      await loadSyncData();
+    } catch (error) {
+      setSyncMessage({ type: 'error', text: error.message || '同步比赛数据失败' });
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  const statusBadge = (statusValue) => {
+    if (statusValue === 'success') {
+      return <span className="inline-flex items-center gap-1 rounded bg-greenx/15 px-2 py-0.5 text-xs font-medium text-greenx">成功</span>;
+    }
+    if (statusValue === 'running') {
+      return <span className="inline-flex items-center gap-1 rounded bg-amberx/15 px-2 py-0.5 text-xs font-medium text-amberx">进行中</span>;
+    }
+    if (statusValue === 'failed') {
+      return <span className="inline-flex items-center gap-1 rounded bg-redx/15 px-2 py-0.5 text-xs font-medium text-redx">失败</span>;
+    }
+    return <span className="inline-flex items-center gap-1 rounded bg-slate-500/15 px-2 py-0.5 text-xs font-medium text-slate-400">{statusValue}</span>;
+  };
+
+  const formatTime = (isoString) => {
+    if (!isoString) return '-';
+    try {
+      const date = new Date(isoString);
+      if (isNaN(date.getTime())) return isoString;
+      return date.toLocaleString('zh-CN', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    } catch {
+      return isoString;
+    }
+  };
+
+  if (loading) {
+    return <LoadingState />;
+  }
+
+  if (loadError) {
+    return <ErrorState />;
+  }
+
+  return (
+    <div className="space-y-6">
+      <PageTitle title="数据同步" description="从外部数据源（mock-provider）同步联赛、球队、比赛和预测数据至 PostgreSQL 数据库。" />
+
+      {/* 同步操作区 */}
+      <section className="rounded border border-line bg-panel/92 shadow-glow p-6">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold">同步比赛数据</h2>
+            <p className="mt-1 text-sm text-slate-400">当前使用模拟数据源（mock-provider），包含利物浦 vs 切尔西、巴黎圣日耳曼 vs 马赛。</p>
+          </div>
+          <button
+            type="button"
+            disabled={syncing}
+            onClick={handleSync}
+            className="inline-flex h-10 items-center gap-2 whitespace-nowrap rounded bg-cyanx px-5 text-sm font-semibold text-[#06111e] transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <RefreshCw size={16} className={syncing ? 'animate-spin' : ''} />
+            {syncing ? '同步中...' : '同步比赛数据'}
+          </button>
+        </div>
+        {syncMessage && (
+          <div className={`mt-4 rounded border px-4 py-3 text-sm ${syncMessage.type === 'success' ? 'border-greenx/30 bg-greenx/[0.04] text-greenx' : 'border-redx/30 bg-redx/[0.04] text-redx'}`}>
+            {syncMessage.text}
+          </div>
+        )}
+      </section>
+
+      {/* 最近一次同步状态 */}
+      <section className="rounded border border-line bg-panel/92 shadow-glow p-6">
+        <h2 className="text-lg font-semibold">最近一次同步状态</h2>
+        {status && status.id ? (
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="rounded border border-line bg-panel-soft p-4">
+              <div className="text-xs text-slate-400">同步类型</div>
+              <div className="mt-1 font-semibold text-white">{status.syncType}</div>
+            </div>
+            <div className="rounded border border-line bg-panel-soft p-4">
+              <div className="text-xs text-slate-400">数据源</div>
+              <div className="mt-1 font-semibold text-white">{status.source}</div>
+            </div>
+            <div className="rounded border border-line bg-panel-soft p-4">
+              <div className="text-xs text-slate-400">状态</div>
+              <div className="mt-1">{statusBadge(status.status)}</div>
+            </div>
+            <div className="rounded border border-line bg-panel-soft p-4">
+              <div className="text-xs text-slate-400">同步时间</div>
+              <div className="mt-1 font-semibold text-white text-sm">{formatTime(status.createdAt)}</div>
+            </div>
+            <div className="rounded border border-line bg-panel-soft p-4">
+              <div className="text-xs text-slate-400">总数 / 成功 / 失败</div>
+              <div className="mt-1 font-semibold text-white">
+                <span>{status.totalCount}</span>
+                <span className="mx-1 text-slate-500">/</span>
+                <span className="text-greenx">{status.successCount}</span>
+                <span className="mx-1 text-slate-500">/</span>
+                <span className="text-redx">{status.failedCount}</span>
+              </div>
+            </div>
+            <div className="rounded border border-line bg-panel-soft p-4 sm:col-span-2 lg:col-span-3">
+              <div className="text-xs text-slate-400">消息</div>
+              <div className="mt-1 text-sm text-slate-300">{status.message || '-'}</div>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 text-sm text-slate-400">{status?.message || '暂无同步记录，点击上方按钮开始同步'}</div>
+        )}
+      </section>
+
+      {/* 同步日志列表 */}
+      <section className="rounded border border-line bg-panel/92 shadow-glow">
+        <div className="border-b border-line px-5 py-4">
+          <h2 className="text-lg font-semibold">同步日志</h2>
+          <p className="mt-1 text-sm text-slate-400">最近 20 条同步记录</p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="min-w-[900px] w-full text-left text-sm">
+            <thead className="bg-panel-soft text-xs uppercase text-slate-400">
+              <tr>
+                <th className="px-5 py-3 font-medium">ID</th>
+                <th className="px-5 py-3 font-medium">类型</th>
+                <th className="px-5 py-3 font-medium">数据源</th>
+                <th className="px-5 py-3 font-medium">状态</th>
+                <th className="px-5 py-3 font-medium">成功/失败</th>
+                <th className="px-5 py-3 font-medium">消息</th>
+                <th className="px-5 py-3 font-medium">时间</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-line">
+              {logs.length > 0 ? (
+                logs.map((log) => (
+                  <tr key={log.id} className="transition hover:bg-cyanx/[0.04]">
+                    <td className="px-5 py-4 text-xs text-slate-500">{log.id}</td>
+                    <td className="px-5 py-4 text-slate-300">{log.syncType}</td>
+                    <td className="px-5 py-4 text-slate-300">{log.source}</td>
+                    <td className="px-5 py-4">{statusBadge(log.status)}</td>
+                    <td className="px-5 py-4">
+                      <span className="text-greenx">{log.successCount}</span>
+                      <span className="mx-1 text-slate-500">/</span>
+                      <span className="text-redx">{log.failedCount}</span>
+                    </td>
+                    <td className="px-5 py-4 text-slate-400 max-w-xs truncate" title={log.message || ''}>{log.message || '-'}</td>
+                    <td className="px-5 py-4 text-xs text-slate-500">{formatTime(log.createdAt)}</td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={7} className="px-5 py-10 text-center text-sm text-slate-400">暂无同步日志</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function StandingsPage() {
+  const [standingsData, setStandingsData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState(null);
+
+  const competitionOptions = [
+    { code: 'PL', label: '英超 Premier League' },
+    { code: 'PD', label: '西甲 La Liga' },
+    { code: 'BL1', label: '德甲 Bundesliga' },
+    { code: 'SA', label: '意甲 Serie A' },
+    { code: 'FL1', label: '法甲 Ligue 1' },
+    { code: 'CL', label: '欧冠 Champions League' },
+  ];
+
+  const [competition, setCompetition] = useState('PL');
+
+  async function loadStandings(comp) {
+    try {
+      setLoading(true);
+      setLoadError(false);
+      setSyncMessage(null);
+      const data = await fetchStandings(comp);
+      setStandingsData(data);
+    } catch (error) {
+      setLoadError(true);
+      setStandingsData(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadStandings(competition);
+  }, [competition]);
+
+  async function handleSyncStandings() {
+    try {
+      setSyncing(true);
+      setSyncMessage(null);
+      const result = await syncFootballStandings(competition);
+      setSyncMessage({ type: 'success', text: result.message || '积分榜同步完成' });
+      await loadStandings(competition);
+    } catch (error) {
+      setSyncMessage({ type: 'error', text: error.message || '同步积分榜失败' });
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  function getFormBadges(form) {
+    if (!form) return null;
+    const chars = form.split(',');
+    return chars.map((ch, i) => {
+      const trim = ch.trim();
+      let colorClass = 'bg-slate-600 text-slate-300';
+      if (trim === 'W') colorClass = 'bg-greenx text-[#06111e]';
+      else if (trim === 'D') colorClass = 'bg-amberx text-[#171107]';
+      else if (trim === 'L') colorClass = 'bg-redx text-white';
+      return (
+        <span key={i} className={`inline-grid h-6 w-6 place-items-center rounded text-xs font-semibold ${colorClass}`}>
+          {trim}
+        </span>
+      );
+    });
+  }
+
+  return (
+    <div className="space-y-6">
+      <PageTitle title="积分榜" description="查看各大联赛实时积分榜排名，支持数据同步刷新。" />
+
+      {/* 联赛切换 + 同步按钮 */}
+      <section className="rounded border border-line bg-panel/92 shadow-glow p-6">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-wrap items-center gap-2">
+            {competitionOptions.map((opt) => (
+              <button
+                key={opt.code}
+                type="button"
+                onClick={() => setCompetition(opt.code)}
+                className={`h-9 rounded px-4 text-sm font-medium transition ${
+                  competition === opt.code
+                    ? 'bg-cyanx text-[#06111e] shadow-glow'
+                    : 'border border-line bg-panel-soft text-slate-300 hover:border-cyanx/50 hover:text-white'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            disabled={syncing}
+            onClick={handleSyncStandings}
+            className="inline-flex h-10 items-center gap-2 whitespace-nowrap rounded bg-cyanx px-5 text-sm font-semibold text-[#06111e] transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <RefreshCw size={16} className={syncing ? 'animate-spin' : ''} />
+            {syncing ? '同步中...' : '同步积分榜'}
+          </button>
+        </div>
+        {syncMessage && (
+          <div className={`mt-4 rounded border px-4 py-3 text-sm ${syncMessage.type === 'success' ? 'border-greenx/30 bg-greenx/[0.04] text-greenx' : 'border-redx/30 bg-redx/[0.04] text-redx'}`}>
+            {syncMessage.text}
+          </div>
+        )}
+      </section>
+
+      {/* 积分榜表格 */}
+      <section className="rounded border border-line bg-panel/92 shadow-glow">
+        {loading ? (
+          <LoadingState />
+        ) : loadError ? (
+          <ErrorState />
+        ) : standingsData && standingsData.standings && standingsData.standings.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="min-w-[900px] w-full text-left text-sm">
+              <thead className="bg-panel-soft text-xs uppercase text-slate-400">
+                <tr>
+                  <th className="px-5 py-3 font-medium w-16">排名</th>
+                  <th className="px-5 py-3 font-medium">球队</th>
+                  <th className="px-5 py-3 font-medium w-16 text-center">已赛</th>
+                  <th className="px-5 py-3 font-medium w-12 text-center">胜</th>
+                  <th className="px-5 py-3 font-medium w-12 text-center">平</th>
+                  <th className="px-5 py-3 font-medium w-12 text-center">负</th>
+                  <th className="px-5 py-3 font-medium w-16 text-center">进球</th>
+                  <th className="px-5 py-3 font-medium w-16 text-center">失球</th>
+                  <th className="px-5 py-3 font-medium w-16 text-center">净胜球</th>
+                  <th className="px-5 py-3 font-medium w-16 text-center">积分</th>
+                  <th className="px-5 py-3 font-medium w-28 text-center">近期状态</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {standingsData.standings.map((row) => {
+                  const isTop4 = row.position <= 4;
+                  return (
+                    <tr key={row.team_id} className={`transition hover:bg-cyanx/[0.04] ${isTop4 ? 'border-l-2 border-l-cyanx' : ''}`}>
+                      <td className="px-5 py-4">
+                        <span className={`inline-flex h-8 w-8 items-center justify-center rounded-full text-sm font-bold ${
+                          row.position === 1 ? 'bg-amberx/20 text-amberx' :
+                          isTop4 ? 'bg-cyanx/15 text-cyanx' :
+                          'text-slate-300'
+                        }`}>
+                          {row.position}
+                        </span>
+                      </td>
+                      <td className="px-5 py-4">
+                        <div className="flex items-center gap-3">
+                          {row.team_crest ? (
+                            <img src={row.team_crest} alt="" className="h-7 w-7 object-contain" onError={(e) => { e.target.style.display = 'none'; }} />
+                          ) : (
+                            <span className="grid h-7 w-7 place-items-center rounded bg-cyanx/10 text-xs text-cyanx">
+                              <Trophy size={14} />
+                            </span>
+                          )}
+                          <span className="font-medium text-white">{row.team_name}</span>
+                        </div>
+                      </td>
+                      <td className="px-5 py-4 text-center text-slate-300">{row.played_games}</td>
+                      <td className="px-5 py-4 text-center text-greenx font-medium">{row.wins}</td>
+                      <td className="px-5 py-4 text-center text-amberx font-medium">{row.draws}</td>
+                      <td className="px-5 py-4 text-center text-redx font-medium">{row.losses}</td>
+                      <td className="px-5 py-4 text-center text-slate-300">{row.goals_for}</td>
+                      <td className="px-5 py-4 text-center text-slate-300">{row.goals_against}</td>
+                      <td className="px-5 py-4 text-center">
+                        <span className={row.goal_difference > 0 ? 'text-greenx font-medium' : row.goal_difference < 0 ? 'text-redx font-medium' : 'text-slate-300'}>
+                          {row.goal_difference > 0 ? '+' : ''}{row.goal_difference}
+                        </span>
+                      </td>
+                      <td className="px-5 py-4 text-center">
+                        <span className="text-lg font-bold text-white">{row.points}</span>
+                      </td>
+                      <td className="px-5 py-4">
+                        <div className="flex justify-center gap-1">
+                          {getFormBadges(row.form)}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <div className="border-t border-line px-5 py-3 text-sm text-slate-400">
+              共 {standingsData.count} 支球队 · 联赛代码：{standingsData.competition} · 更新时间：{new Date(standingsData.standings[0]?.updated_at).toLocaleString('zh-CN')}
+            </div>
+          </div>
+        ) : (
+          <div className="px-5 py-16 text-center">
+            <BarChart3 size={40} className="mx-auto text-slate-600" />
+            <p className="mt-4 text-sm text-slate-400">{standingsData?.message || '暂无积分榜数据'}</p>
+            <button
+              type="button"
+              disabled={syncing}
+              onClick={handleSyncStandings}
+              className="mt-4 inline-flex h-10 items-center gap-2 rounded bg-cyanx px-5 text-sm font-semibold text-[#06111e] transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <RefreshCw size={16} className={syncing ? 'animate-spin' : ''} />
+              同步积分榜
+            </button>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function PageTitle({ title, description }) {
   return (
     <section className="rounded border border-line bg-panel p-5">
@@ -1350,15 +1839,30 @@ function ProbabilityBar({ homeWin, draw, awayWin, className = '' }) {
 }
 
 function ProbabilityDonut({ label, value, color }) {
+  const isPending = value == null;
+
   return (
-    <div className="min-w-20 rounded border border-line bg-panel-soft p-3">
+    <div className={`min-w-20 rounded border ${isPending ? 'border-amberx/20 bg-amberx/[0.03]' : 'border-line bg-panel-soft'} p-3`}>
       <div
         className="mx-auto grid h-16 w-16 place-items-center rounded-full text-sm font-semibold"
-        style={{ background: `conic-gradient(${color} ${value * 3.6}deg, #273247 0deg)` }}
+        style={{
+          background: isPending ? '#1e293b' : `conic-gradient(${color} ${value * 3.6}deg, #273247 0deg)`,
+        }}
       >
-        <span className="grid h-12 w-12 place-items-center rounded-full bg-panel">{value}%</span>
+        <span className={`grid h-12 w-12 place-items-center rounded-full ${isPending ? 'bg-amberx/10 text-amberx text-xs' : 'bg-panel'}`}>
+          {isPending ? '待计算' : `${value}%`}
+        </span>
       </div>
-      <div className="mt-2 text-xs text-slate-400">{label}</div>
+      <div className={`mt-2 text-xs ${isPending ? 'text-amberx' : 'text-slate-400'}`}>{label}</div>
+    </div>
+  );
+}
+
+function FactorItem({ label, value, highlight = '' }) {
+  return (
+    <div className="rounded border border-line bg-panel-soft px-3 py-2.5">
+      <div className="text-xs text-slate-400">{label}</div>
+      <div className={`mt-0.5 text-sm font-semibold ${highlight || 'text-white'}`}>{value}</div>
     </div>
   );
 }
